@@ -11,6 +11,27 @@
 
 using namespace muduo;
 
+//生产者消费者模型
+//前端(任务线程) 生产者 多个
+//后端(日志线程) 消费者 1个
+//
+//blockingqueue
+//消息队列
+
+/* p(semfull) */
+/*     p(mutex) */
+/*     向队列中取出所有的日志消息,写入到文件中 */
+/*     v(mutex) */
+/* v(mutex) */
+
+/* p(semfull) */
+/*     p(mutex) */
+/*     从对列中取道日志消息,写入文件 */
+/*     v(mutex) */
+/* v(mutex) */
+/* 上述操作不好,因为写文件比较频繁,效率比较低 */
+/* muduo使用了多缓冲机制 */
+
 AsyncLogging::AsyncLogging(const string& basename,
                            off_t rollSize,
                            int flushInterval)
