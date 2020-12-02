@@ -1,7 +1,7 @@
 /*
  * @Date: 2020-11-30 21:54:37
  * @LastEditors: OBKoro1
- * @LastEditTime: 2020-12-01 18:21:41
+ * @LastEditTime: 2020-12-02 17:40:21
  * @FilePath: /LibraryCodeComments/coroutine/coroutine.c
  * @Auther: SShouxun
  * @GitHub: https://github.com/RandyLambert
@@ -26,6 +26,19 @@
 struct coroutine;
 
 /**
+ * libco 和 coroutine 都使用的是共享栈模型
+ * 共享栈: 就是所有协程在运行的时候都使用同一个栈空间,好处是节省空间
+ * 非共享栈: 每个协程的栈空间都是独立的,固定大小,好处是协程切换的时候内存不用拷贝来拷贝去,坏处是内存空间浪费
+ * 因为栈空间在运行的时候不能随时扩容,否则如果有指针操作执行了占内存,扩容后将会导致指针失效
+ * 为了防止指针内存不够用,每个栈都要预先开辟一个足够答的栈空间使用,当然很多协程在实际运行的时候用不了太大
+ * 会造成内存的浪费和开辟答内存造成的性能损失
+ * 共享栈则是提前开了一个足够大的栈空间(coroutine 默认是1M),所有栈在运行的时候,都使用这个栈空间
+ * conroutine 是(本文件235行)形式去设置每个协程的运行时栈
+ * C->ctx.uc_stack.ss_sp = S->stack;
+ * C->ctx.uc_stack.ss_size = STACK_SIZE;
+ */
+
+/**
 * 协程调度器的结构体
 */
 struct schedule
@@ -48,7 +61,7 @@ struct coroutine
 	void *ud;			  // 协程参数
 	ucontext_t ctx;		  // 协程上下文
 	struct schedule *sch; // 该协程所属的调度器
-	ptrdiff_t cap;		  // 已经分配的内存大小
+	ptrdiff_t cap;		  // stack区已经分配的内存大小
 	ptrdiff_t size;		  // 当前协程运行时栈，保存起来后的大小
 	int status;			  // 协程当前的状态
 	char *stack;		  // 当前协程的保存起来的运行时栈
@@ -69,13 +82,13 @@ _co_new(struct schedule *S, coroutine_func func, void *ud)
 	co->cap = 0;
 	co->size = 0;
 	co->status = COROUTINE_READY; // 默认的最初状态都是COROUTINE_READY
-	co->stack = NULL;
+	co->stack = NULL;             // 因为是使用的共享栈,这个栈的作用是在协程切出是保存协程栈,所以这个栈在开始的时候没有大小
 	return co;
 }
 
 /**
  * @description: 删除一个协程
- * @param {*}
+ * @param {co 要被删除的协程}
  * @return {*}
  */
 void _co_delete(struct coroutine *co)
@@ -135,7 +148,7 @@ void coroutine_close(struct schedule *S)
 int coroutine_new(struct schedule *S, coroutine_func func, void *ud)
 {
 	struct coroutine *co = _co_new(S, func, ud); //内部函数,创建协程并返回
-	if (S->nco >= S->cap) //此处涉及到了扩容,当目前尚在存货的线程个数nco已经等于或者大于协程调度器的容量cap来了,这时需要对协程调度器进行扩容,这里直接是2倍扩容
+	if (S->nco >= S->cap) //此处涉及到了扩容,当目前尚在存在的线程个数nco已经等于或者大于协程调度器的容量cap来了,这时需要对协程调度器进行扩容,这里直接是2倍扩容
 	{
 		// 那么进行扩容
 		int id = S->cap; // 新的协程的id直接为当前容量的大小
@@ -177,23 +190,23 @@ int coroutine_new(struct schedule *S, coroutine_func func, void *ud)
  * 因为makecontext的函数指针的参数是int可变列表，在64位下，一个int没法承载一个指针
 */
 /**
- * @description: 
- * @param {*}
+ * @description: mainFunc 是对用户提供的协程函数的封装
+ * @param {low32 hi32 为了兼容性,传入的是两和32位地址拼成64位的调度器地址}
  * @return {*}
  */
 static void
 mainfunc(uint32_t low32, uint32_t hi32)
 {
 	uintptr_t ptr = (uintptr_t)low32 | ((uintptr_t)hi32 << 32);
-	struct schedule *S = (struct schedule *)ptr;
+	struct schedule *S = (struct schedule *)ptr; //拼装为地址
 
-	int id = S->running;
-	struct coroutine *C = S->co[id];
-	C->func(S, C->ud); // 中间有可能会有不断的yield
-	_co_delete(C);
-	S->co[id] = NULL;
-	--S->nco;
-	S->running = -1;
+	int id = S->running; //返回目前运行函数的id
+	struct coroutine *C = S->co[id]; // 返回对应的协程
+	C->func(S, C->ud); // 中间有可能会有不断的yield,调用协程函数
+	_co_delete(C); //协程运行完成,删除协程
+	S->co[id] = NULL; //对应的协程指针赋值为NULL
+	--S->nco; //总协程数减少
+	S->running = -1; //当前运行协程切换为主协程
 }
 
 /**
@@ -219,7 +232,7 @@ void coroutine_resume(struct schedule *S, int id)
 		getcontext(&C->ctx);
 		// 将当前协程的运行时栈的栈顶设置为S->stack
 		// 设置当前协程运行时的栈,也就是设置共享栈。（注意，这里是栈顶）
-		C->ctx.uc_stack.ss_sp = S->stack;
+		C->ctx.uc_stack.ss_sp = S->stack; // 设置运行时栈,在协程 yield 的时候,该协程栈的内容暂时保存下来,保存的时候需要用多少内存就开多少内存,减少了内存浪费( save_stack 函数的内容)
 		C->ctx.uc_stack.ss_size = STACK_SIZE; // 设置栈大小
 		C->ctx.uc_link = &S->main; // 如果协程执行完，将切换到主协程(S->main)中执行,如果不设置,则默认是NULL,那么协程执行晚,整个程序就结束了
 		S->running = id;           // 更改调度器正在运行的协程的id
@@ -236,12 +249,14 @@ void coroutine_resume(struct schedule *S, int id)
 		swapcontext(&S->main, &C->ctx);
 		break;
 	case COROUTINE_SUSPEND: // 此状态出现的原因是由于coroutine_yield可以使当前正在运行的协程切换到朱携程中运行,切换完之后该协程就会进入suspend状态
-		// 将协程所保存的栈的内容，拷贝到当前运行时栈中
-		// 其中C->size在yield时有保存
+		// 当对进入 SUSPEND 状态的协程调用 coroutine_resume 会再次切入该协程
+		// 在当时 yield 的时候,协程的栈内容保存到了 C->stack 数组中
+		// 这里用memcpy将协程之前保存的栈内容重新拷贝到运行时的栈里面,将协程所保存的栈的内容，拷贝到当前运行时栈中
+		// S->stack + STACK_SIZE - C->size 这个位置就是之前协程的栈顶位置
 		memcpy(S->stack + STACK_SIZE - C->size, C->stack, C->size);
-		S->running = id;
-		C->status = COROUTINE_RUNNING;
-		swapcontext(&S->main, &C->ctx);
+		S->running = id; // 修改id
+		C->status = COROUTINE_RUNNING; // 切换协程状态为运行状态
+		swapcontext(&S->main, &C->ctx); // 交换上下文
 		break;
 	default:
 		assert(0); //不是上面两种情况直接退出
@@ -262,15 +277,15 @@ _save_stack(struct coroutine *C, char *top)
 	// dummy，此时在栈中，肯定是位于最底的位置的，即栈顶
 	// top - &dummy 即整个栈的容量
 	char dummy = 0;
-	assert(top - &dummy <= STACK_SIZE);
-	if (C->cap < top - &dummy)
+	assert(top - &dummy <= STACK_SIZE); // 断言以分配内存小于当前栈的大小
+	if (C->cap < top - &dummy)// 如果已分配内存小于当前栈的大小,则释放内存重新分配
 	{
 		free(C->stack);
 		C->cap = top - &dummy;
 		C->stack = malloc(C->cap);
 	}
 	C->size = top - &dummy;
-	memcpy(C->stack, &dummy, C->size);
+	memcpy(C->stack, &dummy, C->size); // 从dummy 拷贝 size 内存到 C->stack
 }
 
 /**
@@ -281,20 +296,20 @@ _save_stack(struct coroutine *C, char *top)
 void coroutine_yield(struct schedule *S)
 {
 	// 取出当前正在运行的协程
-	int id = S->running;
+	int id = S->running; // running代表当前运行协程的id
 	assert(id >= 0);
 
-	struct coroutine *C = S->co[id];
+	struct coroutine *C = S->co[id]; // 根据id找到对应的协程
 	assert((char *)&C > S->stack);
 
 	// 将当前运行的协程的栈内容保存起来,因为 coroutine 是基于共享栈的,所以协程的栈内容需要单独保存起来
-	_save_stack(C, S->stack + STACK_SIZE);
+	_save_stack(C, S->stack + STACK_SIZE); // 关键点在找栈顶
 
 	// 将当前栈的状态改为 挂起
 	C->status = COROUTINE_SUSPEND;
 	S->running = -1; // s的运行状态改为没有运行任何协程
 
-	// swapcontext 将当前上下文保存到当前协程的 ucontext中,同事替换当前上下文为主协程的上下文,这样的话.当前协程会被挂起,主协程会被继续执行
+	// swapcontext 将当前上下文保存到当前协程的 ucontext 中,同时替换当前上下文为主协程的上下文,这样的话.当前协程会被挂起,主协程会被继续执行
 	swapcontext(&C->ctx, &S->main); // 这里可以看到，只能从协程切换到主协程中
 
 	// 关键点: 如何保存当前协程的运行时栈,也就是如何获取整个栈的内存空间
@@ -303,7 +318,11 @@ void coroutine_yield(struct schedule *S)
 	// 在 coroutine 中,协程的运行时栈的内存空间是自己分配的,在 coroutine_resume 阶段设置的C->ctx.uc_stack.ss_sp = S.S->stack
 	// 根据以上理论,栈的生长方向是高地址到低地址,因此栈低就是内存地址最大的位置,即 S->stack + STACK_SIZE 就是栈底位置
 }
-
+/**
+ * @description: 返回协程的状态
+ * @param {S 传入调度器,id 传入想要查看的协程 id }
+ * @return {*}
+ */
 int coroutine_status(struct schedule *S, int id)
 {
 	assert(id >= 0 && id < S->cap);
